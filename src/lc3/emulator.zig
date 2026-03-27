@@ -70,7 +70,9 @@ pub const Emulator = struct {
     const BITMASK_FLAG = 0b1;
     const BITMASK_COND = 0b111;
     const BITMASK_IMMVAL5 = 0b11111;
+    const BITMASK_IMMVAL6 = 0b111111;
     const BITMASK_IMMVAL9 = 0b111111111;
+    const BITMASK_IMMVAL11 = 0b11111111111;
 
     // Init a new emluator
     pub fn init() Emulator {
@@ -121,28 +123,134 @@ pub const Emulator = struct {
             switch (op) {
                 .OP_BR => self.opBranch(instr),
                 .OP_ADD => self.opAdd(instr),
-                .OP_LD => break, // load
+                .OP_LD => self.opLoad(instr), // load
                 .OP_ST => break, // store
-                .OP_JSR => break, // jump register
+                .OP_JSR => self.opJumpSubroutine(instr), // jump register
                 .OP_AND => self.opBitwiseAnd(instr),
-                .OP_LDR => break, // load register
+                .OP_LDR => self.opLoadBaseOffset(instr), // load register
                 .OP_STR => break, // store register
                 .OP_RTI => unreachable,
                 .OP_NOT => break, // bitwise not
                 .OP_LDI => self.opLoadIndirect(instr),
                 .OP_STI => break, // store indirect
                 .OP_JMP => self.opJump(instr), // jump
-                .OP_RES => break, // reserved (unused)
+                .OP_RES => unreachable, // reserved (unused)
                 .OP_LEA => break, // load effective address
                 .OP_TRAP => break, // execute trap
             }
         }
     }
 
-    // |16|15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
-    // |--------------------------------------------------|
-    // |     1010     |   000  |  BASE  |     000000      |
-    // |--------------------------------------------------|
+    // |15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
+    // |-----------------------------------------------|
+    // |    0110   |   DR   |  BaseR |     offset6     |
+    // |-----------------------------------------------|
+    //
+    // An address is computed by sign-extending bits [5:0] to 16 bits and adding this
+    // value to the contents of the register specified by bits [8:6]. The contents of memory
+    // at this address are loaded into DR. The condition codes are set, based on whether
+    // the value loaded is negative, zero, or positive.
+    fn opLoadBaseOffset(self: *Emulator, instr: u16) void {
+        const dr: Register = @enumFromInt((instr >> 9) & BITMASK_REGISTER);
+        const base: Register = @enumFromInt((instr >> 6) & BITMASK_REGISTER);
+        const addr = self.register(base) + signExtend(instr & BITMASK_IMMVAL6, 6);
+        self.registerPtr(dr).* = self.memRead(addr);
+        self.updateConds(dr);
+    }
+
+    test "opLoadBaseOffset" {
+        var em = Emulator.init();
+        em.memory[20] = 100;
+        em.registerPtr(.R_R0).* = 10;
+        em.opLoadBaseOffset(@intFromEnum(Instruction.OP_LDR) << 12 |
+            @intFromEnum(Register.R_R1) << 9 |
+            @intFromEnum(Register.R_R0) << 9 |
+            10);
+        try std.testing.expectEqual(100, em.register(.R_R1));
+    }
+
+    // |15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
+    // |-----------------------------------------------|
+    // |    0010   |   DR   |          PCOffset9       |
+    // |-----------------------------------------------|
+    //
+    // An address is computed by sign-extending bits [8:0] to 16 bits and adding this
+    // value to the incremented PC. The contents of memory at this address are loaded
+    // into DR. The condition codes are set, based on whether the value loaded is
+    // negative, zero, or positive
+    fn opLoad(self: *Emulator, instr: u16) void {
+        const dr: Register = @enumFromInt(instr >> 9 & BITMASK_REGISTER);
+        const offset = signExtend(instr & BITMASK_IMMVAL9, 9);
+        self.registerPtr(dr).* = self.memRead(self.register(.R_PC) + offset);
+        self.updateConds(dr);
+    }
+
+    test "opLoad" {
+        var em = Emulator.init();
+        em.memory[100] = 255;
+        em.opLoad(@intFromEnum(Instruction.OP_LD) << 12 |
+            @intFromEnum(Register.R_R0) << 9 |
+            100);
+        try std.testing.expectEqual(255, em.register(.R_R0));
+        try std.testing.expectEqual(@intFromEnum(Condition.FL_POS), em.register(.R_COND));
+    }
+
+    // |15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
+    // |-----------------------------------------------|
+    // |    0100   | 1|         PCOffset11             | JSR
+    // |-----------------------------------------------|
+    //
+    // |15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
+    // |-----------------------------------------------|
+    // |    0100   | 0|  00 |  BASE  |      000000     | JSRR
+    // |-----------------------------------------------|
+    // First, the incremented PC is saved in R7. This is the linkage back to the calling
+    // routine. Then the PC is loaded with the address of the first instruction of the
+    // subroutine, causing an unconditional jump to that address. The address of the
+    // subroutine is obtained from the base register (if bit [11] is 0), or the address is
+    // computed by sign-extending bits [10:0] and adding this value to the incremented
+    // PC (if bit [11] is 1).
+    fn opJumpSubroutine(self: *Emulator, instr: u16) void {
+        self.registerPtr(.R_R7).* = self.register(.R_PC);
+
+        if ((instr >> 11) & BITMASK_FLAG > 0) {
+            const offset = signExtend(instr & BITMASK_IMMVAL11, 11);
+            self.registerPtr(.R_PC).* = self.register(.R_PC) + offset;
+        } else {
+            const base: Register = @enumFromInt((instr >> 6) & BITMASK_REGISTER);
+            self.registerPtr(.R_PC).* = self.register(base);
+        }
+    }
+
+    test "opJumpSubroutine reg" {
+        var em = Emulator.init();
+        em.registerPtr(.R_PC).* = 100;
+        em.registerPtr(.R_R0).* = 1000;
+
+        em.opJumpSubroutine(@intFromEnum(Instruction.OP_JSR) << 12 |
+            @intFromEnum(Register.R_R0) << 6);
+
+        try std.testing.expectEqual(100, em.register(.R_R7));
+        try std.testing.expectEqual(1000, em.register(.R_PC));
+    }
+
+    test "opJumpSubroutine imm" {
+        var em = Emulator.init();
+        em.registerPtr(.R_PC).* = 100;
+        em.registerPtr(.R_R0).* = 1000;
+
+        em.opJumpSubroutine(@intFromEnum(Instruction.OP_JSR) << 12 |
+            1 << 11 |
+            255);
+
+        try std.testing.expectEqual(100, em.register(.R_R7));
+        try std.testing.expectEqual(355, em.register(.R_PC));
+    }
+
+    // |15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
+    // |-----------------------------------------------|
+    // |    1010   |   000  |  BASE  |     000000      |
+    // |-----------------------------------------------|
     // The program unconditionally jumps to the location specified by the contents of
     // the base register. Bits [8:6] identify the base register.
     //
@@ -161,10 +269,10 @@ pub const Emulator = struct {
         try std.testing.expectEqual(100, em.register(.R_PC));
     }
 
-    // |16|15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
-    // |--------------------------------------------------|
-    // |     1010     |   DR   |       PCOffset9          |
-    // |--------------------------------------------------|
+    // |15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
+    // |-----------------------------------------------|
+    // |    1010   |   DR   |       PCOffset9          |
+    // |-----------------------------------------------|
     // An address is computed by sign-extending bits [8:0] to 16 bits and adding
     // this value to the incremented PC. What is stored in memory at this address
     // is the address of the data to be loaded into DR. (Pg. 532)
@@ -177,13 +285,13 @@ pub const Emulator = struct {
     test "Load Indirect" {
         var em: Emulator = Emulator.init();
         // set memory location 9 to the address of memory location 10
-        em.memory[9] = 10 * @sizeOf(u16);
+        em.memory[9] = 10;
         // set memory location 10 to the value 255
         em.memory[10] = 255;
 
         em.opLoadIndirect((@intFromEnum(Instruction.OP_LDI) << 12) |
             @intFromEnum(Register.R_R0) << 9 |
-            9 * @sizeOf(u16));
+            9);
         try std.testing.expectEqual(255, em.register(.R_R0));
     }
 
@@ -218,7 +326,7 @@ pub const Emulator = struct {
             const sr2: Register = @enumFromInt(instr & BITMASK_REGISTER);
             self.registerPtr(dr).* = self.register(sr1) + self.register(sr2);
         }
-        self.updateFlags(dr);
+        self.updateConds(dr);
     }
 
     test "opAdd reg" {
@@ -248,15 +356,15 @@ pub const Emulator = struct {
     //     AND DR, SR1, SR2
     //     AND DR, SR1, imm5
     //
-    // |16|15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
-    // |o-------------------------------------------------|
-    // |     0001     |   DR   |   SR1  | 0|  00 |  SR2   |
-    // |--------------------------------------------------|
+    // |15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
+    // |-----------------------------------------------|
+    // |    0001   |   DR   |   SR1  | 0|  00 |  SR2   |
+    // |-----------------------------------------------|
     //
-    // |16|15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
-    // |--------------------------------------------------|
-    // |     0001     |   DR   |   SR1  | 1|   imm5       |
-    // |--------------------------------------------------|
+    // |15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
+    // |-----------------------------------------------|
+    // |    0001   |   DR   |   SR1  | 1|   imm5       |
+    // |-----------------------------------------------|
     //
     // If bit [5] is 0, the second source operand is obtained from SR2. If bit [5] is 1,
     // the second source operand is obtained by sign-extending the imm5 field to 16
@@ -276,7 +384,7 @@ pub const Emulator = struct {
             const sr2: Register = @enumFromInt(instr & BITMASK_REGISTER);
             self.registerPtr(dr).* = self.register(sr1) & self.register(sr2);
         }
-        self.updateFlags(dr);
+        self.updateConds(dr);
     }
 
     test "opBitwiseAnd reg" {
@@ -393,13 +501,13 @@ pub const Emulator = struct {
     }
 
     pub fn memRead(self: *Emulator, addr: u16) u16 {
-        return self.memory[addr / @sizeOf(u16)];
+        return self.memory[addr];
     }
 
     // updateFlags updates the R_COND register
     // Any time a value is written to a register, we need to update the flags
     // to indicate its sign. We will write a function so that this can be reused
-    pub fn updateFlags(self: *Emulator, r: Register) void {
+    pub fn updateConds(self: *Emulator, r: Register) void {
         const p = self.registerPtr(r);
         if (p.* == 0) {
             self.registerPtr(.R_COND).* = @intFromEnum(Condition.FL_ZRO);
