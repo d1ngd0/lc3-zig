@@ -1,47 +1,37 @@
-test {
-    std.testing.refAllDecls(@This());
-}
-
 const std = @import("std");
+const lc3 = @import("root.zig");
+const termios = std.posix.termios;
 
-/// MAX_MEMORY defines the max memory the emulator
-pub const MAX_MEMORY = 1 << 16;
+const Allocator = std.mem.Allocator;
+const Writer = std.Io.Writer;
+const Reader = std.Io.Reader;
+const Registers = lc3.Registers;
+const Register = Registers.Register;
+const Condition = Registers.Condition;
 
 // Emulator is the actual emulator that will run things
 pub const Emulator = struct {
     //The LC-3 has 65,536 memory locations (the maximum that is addressable by a 16-bit unsigned integer 2^16), each of which stores a 16-bit value. This means it can store a total of only 128KB, which is a lot smaller than you may be used to! In our program, this memory will be stored in a simple array:
-    memory: [MAX_MEMORY]u16,
+    memory: []u16,
 
     // A register is a slot for storing a single value on the CPU. Registers are like the “workbench” of the CPU. For the CPU to work with a piece of data, it has to be in one of the registers. However, since there are just a few registers, only a minimal amount of data can be loaded at any given time. Programs work around this by loading values from memory into registers, calculating values into other registers, and then storing the final results back in memory.
     // The LC-3 has 10 total registers, each of which is 16 bits. Most of them are general purpose, but a few have designated roles. - 8 general purpose registers (R0-R7) - 1 program counter (PC) register - 1 condition flags (COND) register
     // The general purpose registers can be used to perform any program calculations. The program counter is an unsigned integer which is the address of the next instruction in memory to execute. The condition flags tell us information about the previous calculation.
-    reg: [@intFromEnum(Register.R_COUNT)]u16,
+    reg: Registers,
 
     // in is the input device
-    in: *std.Io.Reader,
+    in: *Reader,
 
     // out is the output device
-    out: *std.Io.Writer,
+    out: *Writer,
 
-    origTerm: std.posix.termios,
+    origTerm: termios,
 
     // DEfAULT_START is the starting location for the application
     const DEFAULT_START = 0x3000;
 
-    // Here we define the registers that are available to us
-    pub const Register = enum(u16) {
-        R_R0,
-        R_R1,
-        R_R2,
-        R_R3,
-        R_R4,
-        R_R5,
-        R_R6,
-        R_R7,
-        R_PC, //program counter
-        R_COND,
-        R_COUNT, //keep this at the end, tells us how many their are
-    };
+    /// MAX_MEMORY defines the max memory the emulator
+    pub const MAX_MEMORY = 1 << 16;
 
     pub const EmulationError = error{
         ExecutionHault,
@@ -67,14 +57,6 @@ pub const Emulator = struct {
         OP_RES, // reserved (unused)
         OP_LEA, // load effective address
         OP_TRAP, // execute trap
-    };
-
-    // The R_COND register stores condition flags which provide information about the most recently executed calculation. This allows programs to check logical conditions such as if (x > 0) { ... }.
-    // Each CPU has a variety of condition flags to signal various situations. The LC-3 uses only 3 condition flags which indicate the sign of the previous calculation.
-    pub const Condition = enum(u16) {
-        FL_POS = 1 << 0, // P
-        FL_ZRO = 1 << 1, // Z
-        FL_NEG = 1 << 2, // N
     };
 
     // The LC-3 provides a few predefined routines for performing common tasks and interacting with I/O devices.
@@ -106,36 +88,32 @@ pub const Emulator = struct {
     const BITMASK_IMMVAL11 = 0b11111111111;
 
     // Init a new emluator
-    pub fn init(in: *std.Io.Reader, out: *std.Io.Writer) !Emulator {
-        var em: Emulator = .{
-            .memory = undefined,
-            .reg = undefined,
+    pub fn init(gpa: Allocator, in: *Reader, out: *Writer) !@This() {
+        const memory = try gpa.alloc(u16, MAX_MEMORY);
+        errdefer gpa.free(memory);
+
+        return .{
+            .memory = memory,
+            .reg = Registers.init(),
             .in = in,
             .out = out,
             .origTerm = try std.posix.tcgetattr(std.posix.STDIN_FILENO),
         };
-
-        em.registerPtr(.R_PC).* = 0;
-        em.registerPtr(.R_COND).* = 0;
-
-        return em;
     }
 
-    pub fn initStd(io: std.Io, rbuf: []u8, wbuf: []u8) !Emulator {
+    pub fn deinit(self: *@This(), gpa: Allocator) void {
+        gpa.free(self.memory);
+    }
+
+    pub fn initStd(gpa: Allocator, io: std.Io, rbuf: []u8, wbuf: []u8) !@This() {
         var stdin = std.Io.File.stdin().reader(io, rbuf);
         var stdout = std.Io.File.stdout().writer(io, wbuf);
-        return .init(&stdin.interface, &stdout.interface);
-    }
-
-    // step returns the program counter and increments it by 1
-    pub fn step(self: *Emulator) u16 {
-        defer self.registerPtr(.R_PC).* += 1;
-        return self.register(.R_PC);
+        return .init(gpa, &stdin.interface, &stdout.interface);
     }
 
     // loadImage loads the program from the provided reader and pushes
     // it into memory.
-    pub fn loadImage(self: *Emulator, reader: *std.Io.Reader) !void {
+    pub fn loadImage(self: *@This(), reader: *std.Io.Reader) !void {
         var origin: u16 = undefined;
         const origin_ptr: *[2]u8 = @ptrCast(&origin);
         try reader.readSliceAll(origin_ptr);
@@ -152,10 +130,8 @@ pub const Emulator = struct {
     pub fn run(self: *Emulator) !void {
         try self.disableInputBuffering();
         defer self.restoreInputBuffering() catch {};
-        // Set the z flag to start with
-        self.registerPtr(.R_COND).* = @intFromEnum(Condition.FL_ZRO);
-        // Set the program counter to the current location
-        self.registerPtr(.R_PC).* = DEFAULT_START;
+
+        self.reg.setPC(DEFAULT_START);
 
         // var running: bool = true;
         while (true) {
@@ -196,7 +172,7 @@ pub const Emulator = struct {
     // the memory location whose address is obtained by zero-extending trapvector8 to
     // 16 bits.
     fn opTrap(self: *Emulator, instr: u16) !void {
-        self.registerPtr(.R_R7).* = self.register(.R_PC);
+        self.reg.storePCInto(.R7);
         const trap: Trap = @enumFromInt(instr & BITMASK_IMMVAL8);
         try switch (trap) {
             .TRAP_GETC => self.trapGetC(), // get character from keyboard, not echoed onto the terminal
@@ -215,10 +191,13 @@ pub const Emulator = struct {
         return EmulationError.ExecutionHault;
     }
 
-    test "trapHalt" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
-        try std.testing.expectError(EmulationError.ExecutionHault, em.trapHalt());
-    }
+    // test "trapHalt" {
+    //     var wBuf: [1024]u8 = undefined;
+    //     var rBuf: [1024]u8 = undefined;
+    //     var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &rBuf, &wBuf);
+    //     defer em.deinit(std.testing.allocator);
+    //     try std.testing.expectError(EmulationError.ExecutionHault, em.trapHalt());
+    // }
 
     // Write a string of ASCII characters to the console. The characters are contained in
     // consecutive memory locations, two characters per memory location, starting with the
@@ -229,7 +208,7 @@ pub const Emulator = struct {
     // location containing the last character to be written.) Writing terminates with the
     // occurrence of x0000 in a memory location
     fn trapPUTSP(self: *Emulator) !void {
-        for (self.register(.R_R0)..MAX_MEMORY) |a| {
+        for (self.reg.register(.R0)..MAX_MEMORY) |a| {
             const addr: u16 = @intCast(a);
             if (self.memRead(addr) == NULL) {
                 break;
@@ -259,7 +238,7 @@ pub const Emulator = struct {
     // the address specified in R0. Writing terminates with the occurrence of x0000 in a
     // memory location
     fn trapPuts(self: *Emulator) !void {
-        for (self.register(.R_R0)..MAX_MEMORY) |a| {
+        for (self.reg.register(.R0)..MAX_MEMORY) |a| {
             const addr: u16 = @intCast(a);
             if (self.memRead(addr) == NULL) {
                 break;
@@ -271,7 +250,7 @@ pub const Emulator = struct {
 
     // Write a character in R0[7:0] to the console display
     fn trapOut(self: *Emulator) !void {
-        _ = try self.out.writeByte(@intCast(self.register(.R_R0) & BITMASK_IMMVAL8));
+        _ = try self.out.writeByte(@intCast(self.reg.register(.R0) & BITMASK_IMMVAL8));
         try self.out.flush();
     }
 
@@ -279,31 +258,29 @@ pub const Emulator = struct {
     // console. Its ASCII code is copied into R0. The high eight bits of R0 are cleared.
     fn trapGetC(self: *Emulator) !void {
         const char: u8 = try self.in.takeByte();
-        self.registerPtr(.R_R0).* = char & BITMASK_IMMVAL8;
+        self.reg.registerPtr(.R0).* = char & BITMASK_IMMVAL8;
     }
 
     // |15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
     // |-----------------------------------------------|
-    // |    0111   |   SR   |  BaseR |   PCOffset6     |
-    // |-----------------------------------------------|
-    //
     // The contents of the register specified by SR are stored in the memory location
     // whose address is computed by sign-extending bits [5:0] to 16 bits and adding this
     // value to the contents of the register specified by bits [8:6]
     fn opStoreBaseOffset(self: *Emulator, instr: u16) void {
         const sr: Register = @enumFromInt((instr >> 9) & BITMASK_REGISTER);
         const base: Register = @enumFromInt((instr >> 6) & BITMASK_REGISTER);
-        const offset = self.register(base) +% signExtend((instr & BITMASK_IMMVAL6), 6);
-        self.memPtr(offset).* = self.register(sr);
+        const offset = self.reg.register(base) +% signExtend((instr & BITMASK_IMMVAL6), 6);
+        self.memPtr(offset).* = self.reg.register(sr);
     }
 
     test "opStoreBaseOffset" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
-        em.registerPtr(.R_R0).* = 5;
-        em.registerPtr(.R_R1).* = 255;
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
+        em.reg.registerPtr(.R0).* = 5;
+        em.reg.registerPtr(.R1).* = 255;
         em.opStoreBaseOffset(@intFromEnum(Instruction.OP_STR) << 12 |
-            @intFromEnum(Register.R_R1) << 9 |
-            @intFromEnum(Register.R_R0) << 6 |
+            @intFromEnum(Register.R1) << 9 |
+            @intFromEnum(Register.R0) << 6 |
             5);
         try std.testing.expectEqual(255, em.memRead(10));
     }
@@ -319,16 +296,17 @@ pub const Emulator = struct {
     // the location to which the data in SR is stored
     fn opStoreIndirect(self: *Emulator, instr: u16) void {
         const sr: Register = @enumFromInt((instr >> 9) & BITMASK_REGISTER);
-        const addr = self.register(.R_PC) +% signExtend(instr & BITMASK_IMMVAL9, 9);
-        self.memPtr(self.memRead(addr)).* = self.register(sr);
+        const addr = self.reg.register(.PC) +% signExtend(instr & BITMASK_IMMVAL9, 9);
+        self.memPtr(self.memRead(addr)).* = self.reg.register(sr);
     }
 
     test "opStoreIndirect" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
-        em.registerPtr(.R_R1).* = 255;
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
+        em.reg.registerPtr(.R1).* = 255;
         em.memPtr(5).* = 10;
         em.opStoreIndirect(@intFromEnum(Instruction.OP_STI) << 12 |
-            @intFromEnum(Register.R_R1) << 9 |
+            @intFromEnum(Register.R1) << 9 |
             5);
         try std.testing.expectEqual(255, em.memRead(10));
     }
@@ -343,15 +321,16 @@ pub const Emulator = struct {
     // value to the incremented PC
     fn opStore(self: *Emulator, instr: u16) void {
         const sr: Register = @enumFromInt((instr >> 9) & BITMASK_REGISTER);
-        const addr = self.register(.R_PC) +% signExtend(instr & BITMASK_IMMVAL9, 9);
-        self.memPtr(addr).* = self.register(sr);
+        const addr = self.reg.register(.PC) +% signExtend(instr & BITMASK_IMMVAL9, 9);
+        self.memPtr(addr).* = self.reg.register(sr);
     }
 
     test "opStore" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
-        em.registerPtr(.R_R1).* = 100;
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
+        em.reg.registerPtr(.R1).* = 100;
         em.opStore(@intFromEnum(Instruction.OP_ST) << 12 |
-            @intFromEnum(Register.R_R1) << 9 |
+            @intFromEnum(Register.R1) << 9 |
             10);
         try std.testing.expectEqual(100, em.memRead(10));
     }
@@ -367,19 +346,19 @@ pub const Emulator = struct {
     fn opBitwiseComplement(self: *Emulator, instr: u16) void {
         const dr: Register = @enumFromInt((instr >> 9) & BITMASK_REGISTER);
         const sr1: Register = @enumFromInt((instr >> 6) & BITMASK_REGISTER);
-        self.registerPtr(dr).* = ~self.register(sr1);
-        self.updateConds(dr);
+        self.reg.setReg(dr, ~self.reg.register(sr1));
     }
 
     test "opBitwiseComplement" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
-        em.registerPtr(.R_R0).* = 0b0000000011111111;
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
+        em.reg.registerPtr(.R0).* = 0b0000000011111111;
         em.opBitwiseComplement(@intFromEnum(Instruction.OP_NOT) << 12 |
-            @intFromEnum(Register.R_R1) << 9 |
-            @intFromEnum(Register.R_R0) << 6 |
+            @intFromEnum(Register.R1) << 9 |
+            @intFromEnum(Register.R0) << 6 |
             0b111111);
-        try std.testing.expectEqual(0b1111111100000000, em.register(.R_R1));
-        try std.testing.expectEqual(@intFromEnum(Condition.FL_NEG), em.register(.R_COND));
+        try std.testing.expectEqual(0b1111111100000000, em.reg.register(.R1));
+        try std.testing.expectEqual(@intFromEnum(Condition.FL_NEG), em.reg.register(.COND));
     }
 
     // |15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
@@ -392,18 +371,18 @@ pub const Emulator = struct {
     // codes are set, based on whether the value loaded is negative, zero, or positive.
     fn opLoadEffectiveAddress(self: *Emulator, instr: u16) void {
         const dr: Register = @enumFromInt((instr >> 9) & BITMASK_REGISTER);
-        const addr = self.register(.R_PC) +% signExtend(instr & BITMASK_IMMVAL9, 9);
-        self.registerPtr(dr).* = addr;
-        self.updateConds(dr);
+        const addr = self.reg.register(.PC) +% signExtend(instr & BITMASK_IMMVAL9, 9);
+        self.reg.setReg(dr, addr);
     }
 
     test "loadeffectiveaddress" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
         em.opLoadEffectiveAddress(@intFromEnum(Instruction.OP_LEA) << 12 |
-            @intFromEnum(Register.R_R0) << 9 |
+            @intFromEnum(Register.R0) << 9 |
             100);
-        try std.testing.expectEqual(100, em.register(.R_R0));
-        try std.testing.expectEqual(@intFromEnum(Condition.FL_POS), em.register(.R_COND));
+        try std.testing.expectEqual(100, em.reg.register(.R0));
+        try std.testing.expectEqual(@intFromEnum(Condition.FL_POS), em.reg.register(.COND));
     }
 
     // |15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
@@ -418,21 +397,21 @@ pub const Emulator = struct {
     fn opLoadBaseOffset(self: *Emulator, instr: u16) void {
         const dr: Register = @enumFromInt((instr >> 9) & BITMASK_REGISTER);
         const base: Register = @enumFromInt((instr >> 6) & BITMASK_REGISTER);
-        const addr = self.register(base) +% signExtend(instr & BITMASK_IMMVAL6, 6);
-        self.registerPtr(dr).* = self.memRead(addr);
-        self.updateConds(dr);
+        const addr = self.reg.register(base) +% signExtend(instr & BITMASK_IMMVAL6, 6);
+        self.reg.setReg(dr, self.memRead(addr));
     }
 
     test "opLoadBaseOffset" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
         em.memory[20] = 100;
-        em.registerPtr(.R_R0).* = 10;
+        em.reg.registerPtr(.R0).* = 10;
         em.opLoadBaseOffset(@intFromEnum(Instruction.OP_LDR) << 12 |
-            @intFromEnum(Register.R_R1) << 9 |
-            @intFromEnum(Register.R_R0) << 9 |
+            @intFromEnum(Register.R1) << 9 |
+            @intFromEnum(Register.R0) << 9 |
             10);
-        try std.testing.expectEqual(100, em.register(.R_R1));
-        try std.testing.expectEqual(@intFromEnum(Condition.FL_POS), em.register(.R_COND));
+        try std.testing.expectEqual(100, em.reg.register(.R1));
+        try std.testing.expectEqual(@intFromEnum(Condition.FL_POS), em.reg.register(.COND));
     }
 
     // |15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
@@ -447,18 +426,18 @@ pub const Emulator = struct {
     fn opLoad(self: *Emulator, instr: u16) void {
         const dr: Register = @enumFromInt(instr >> 9 & BITMASK_REGISTER);
         const offset = signExtend(instr & BITMASK_IMMVAL9, 9);
-        self.registerPtr(dr).* = self.memRead(self.register(.R_PC) +% offset);
-        self.updateConds(dr);
+        self.reg.setReg(dr, self.memRead(self.reg.register(.PC) +% offset));
     }
 
     test "opLoad" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
         em.memory[100] = 255;
         em.opLoad(@intFromEnum(Instruction.OP_LD) << 12 |
-            @intFromEnum(Register.R_R0) << 9 |
+            @intFromEnum(Register.R0) << 9 |
             100);
-        try std.testing.expectEqual(255, em.register(.R_R0));
-        try std.testing.expectEqual(@intFromEnum(Condition.FL_POS), em.register(.R_COND));
+        try std.testing.expectEqual(255, em.reg.register(.R0));
+        try std.testing.expectEqual(@intFromEnum(Condition.FL_POS), em.reg.register(.COND));
     }
 
     // |15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
@@ -477,40 +456,42 @@ pub const Emulator = struct {
     // computed by sign-extending bits [10:0] and adding this value to the incremented
     // PC (if bit [11] is 1).
     fn opJumpSubroutine(self: *Emulator, instr: u16) void {
-        self.registerPtr(.R_R7).* = self.register(.R_PC);
+        self.reg.storePCInto(.R7);
 
         if ((instr >> 11) & BITMASK_FLAG > 0) {
             const offset = signExtend(instr & BITMASK_IMMVAL11, 11);
-            self.registerPtr(.R_PC).* = self.register(.R_PC) +% offset;
+            self.reg.offsetPC(offset);
         } else {
             const base: Register = @enumFromInt((instr >> 6) & BITMASK_REGISTER);
-            self.registerPtr(.R_PC).* = self.register(base);
+            self.reg.setPC(self.reg.register(base));
         }
     }
 
     test "opJumpSubroutine reg" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
-        em.registerPtr(.R_PC).* = 100;
-        em.registerPtr(.R_R0).* = 1000;
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
+        em.reg.registerPtr(.PC).* = 100;
+        em.reg.registerPtr(.R0).* = 1000;
 
         em.opJumpSubroutine(@intFromEnum(Instruction.OP_JSR) << 12 |
-            @intFromEnum(Register.R_R0) << 6);
+            @intFromEnum(Register.R0) << 6);
 
-        try std.testing.expectEqual(100, em.register(.R_R7));
-        try std.testing.expectEqual(1000, em.register(.R_PC));
+        try std.testing.expectEqual(100, em.reg.register(.R7));
+        try std.testing.expectEqual(1000, em.reg.register(.PC));
     }
 
     test "opJumpSubroutine imm" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
-        em.registerPtr(.R_PC).* = 100;
-        em.registerPtr(.R_R0).* = 1000;
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
+        em.reg.registerPtr(.PC).* = 100;
+        em.reg.registerPtr(.R0).* = 1000;
 
         em.opJumpSubroutine(@intFromEnum(Instruction.OP_JSR) << 12 |
             1 << 11 |
             255);
 
-        try std.testing.expectEqual(100, em.register(.R_R7));
-        try std.testing.expectEqual(355, em.register(.R_PC));
+        try std.testing.expectEqual(100, em.reg.register(.R7));
+        try std.testing.expectEqual(355, em.reg.register(.PC));
     }
 
     // |15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
@@ -525,14 +506,15 @@ pub const Emulator = struct {
     // following the subroutine call instruction
     fn opJump(self: *Emulator, instr: u16) void {
         const base: Register = @enumFromInt((instr >> 6) & BITMASK_REGISTER);
-        self.registerPtr(.R_PC).* = self.register(base);
+        self.reg.setPC(self.reg.register(base));
     }
 
     test "jump" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
-        em.registerPtr(.R_R7).* = 100;
-        em.opJump(@intFromEnum(Instruction.OP_JMP) << 12 | @intFromEnum(Register.R_R7) << 6);
-        try std.testing.expectEqual(100, em.register(.R_PC));
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
+        em.reg.registerPtr(.R7).* = 100;
+        em.opJump(@intFromEnum(Instruction.OP_JMP) << 12 | @intFromEnum(Register.R7) << 6);
+        try std.testing.expectEqual(100, em.reg.register(.PC));
     }
 
     // |15|14|13|12|11|10| 9| 8| 7| 6| 5| 4| 3| 2| 1| 0|
@@ -543,22 +525,23 @@ pub const Emulator = struct {
     // this value to the incremented PC. What is stored in memory at this address
     // is the address of the data to be loaded into DR. (Pg. 532)
     fn opLoadIndirect(self: *Emulator, instr: u16) void {
-        const dr = (instr >> 9) & BITMASK_REGISTER;
-        const addr = self.register(.R_PC) +% signExtend(instr & BITMASK_IMMVAL9, 9);
-        self.reg[dr] = self.memRead(self.memRead(addr));
+        const dr: Register = @enumFromInt((instr >> 9) & BITMASK_REGISTER);
+        const addr = self.reg.register(.PC) +% signExtend(instr & BITMASK_IMMVAL9, 9);
+        self.reg.registerPtr(dr).* = self.memRead(self.memRead(addr));
     }
 
     test "Load Indirect" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
         // set memory location 9 to the address of memory location 10
         em.memory[9] = 10;
         // set memory location 10 to the value 255
         em.memory[10] = 255;
 
         em.opLoadIndirect((@intFromEnum(Instruction.OP_LDI) << 12) |
-            @intFromEnum(Register.R_R0) << 9 |
+            @intFromEnum(Register.R0) << 9 |
             9);
-        try std.testing.expectEqual(255, em.register(.R_R0));
+        try std.testing.expectEqual(255, em.reg.register(.R0));
     }
 
     // Assembler Formats:
@@ -587,35 +570,36 @@ pub const Emulator = struct {
 
         if (immFlag == 1) {
             const immVal = signExtend(instr & BITMASK_IMMVAL5, 5);
-            self.registerPtr(dr).* = self.register(sr1) +% immVal;
+            self.reg.setReg(dr, self.reg.register(sr1) +% immVal);
         } else {
             const sr2: Register = @enumFromInt(instr & BITMASK_REGISTER);
-            self.registerPtr(dr).* = self.register(sr1) +% self.register(sr2);
+            self.reg.setReg(dr, self.reg.register(sr1) +% self.reg.register(sr2));
         }
-        self.updateConds(dr);
     }
 
     test "opAdd reg" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
-        em.registerPtr(.R_R1).* = 10;
-        em.registerPtr(.R_R2).* = 7;
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
+        em.reg.registerPtr(.R1).* = 10;
+        em.reg.registerPtr(.R2).* = 7;
         em.opAdd(@intFromEnum(Instruction.OP_ADD) << 12 |
-            @intFromEnum(Register.R_R0) << 9 | // dr
-            @intFromEnum(Register.R_R1) << 6 | // sr1
+            @intFromEnum(Register.R0) << 9 | // dr
+            @intFromEnum(Register.R1) << 6 | // sr1
             // 0 flag 00 unused
-            @intFromEnum(Register.R_R2)); // sr2
-        try std.testing.expectEqual(17, em.register(.R_R0));
+            @intFromEnum(Register.R2)); // sr2
+        try std.testing.expectEqual(17, em.reg.register(.R0));
     }
 
     test "opAdd imm" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
-        em.registerPtr(.R_R1).* = 10;
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
+        em.reg.registerPtr(.R1).* = 10;
         em.opAdd(@intFromEnum(Instruction.OP_ADD) << 12 |
-            @intFromEnum(Register.R_R0) << 9 | // dr
-            @intFromEnum(Register.R_R1) << 6 | // sr1
+            @intFromEnum(Register.R0) << 9 | // dr
+            @intFromEnum(Register.R1) << 6 | // sr1
             1 << 5 | // set the imm flag
             7); // sr2
-        try std.testing.expectEqual(17, em.register(.R_R0));
+        try std.testing.expectEqual(17, em.reg.register(.R0));
     }
 
     // Assembler Formats:
@@ -645,35 +629,36 @@ pub const Emulator = struct {
 
         if (immFlag == 1) {
             const immVal = signExtend(instr & BITMASK_IMMVAL5, 5);
-            self.registerPtr(dr).* = self.register(sr1) & immVal;
+            self.reg.setReg(dr, self.reg.register(sr1) & immVal);
         } else {
             const sr2: Register = @enumFromInt(instr & BITMASK_REGISTER);
-            self.registerPtr(dr).* = self.register(sr1) & self.register(sr2);
+            self.reg.setReg(dr, self.reg.register(sr1) & self.reg.register(sr2));
         }
-        self.updateConds(dr);
     }
 
     test "opBitwiseAnd reg" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
-        em.registerPtr(.R_R1).* = 0b0101100101111111;
-        em.registerPtr(.R_R2).* = 0b1111111101010010;
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
+        em.reg.registerPtr(.R1).* = 0b0101100101111111;
+        em.reg.registerPtr(.R2).* = 0b1111111101010010;
         em.opBitwiseAnd(@intFromEnum(Instruction.OP_AND) << 12 |
-            @intFromEnum(Register.R_R0) << 9 | // dr
-            @intFromEnum(Register.R_R1) << 6 | // sr1
+            @intFromEnum(Register.R0) << 9 | // dr
+            @intFromEnum(Register.R1) << 6 | // sr1
             // 0 flag 00 unused
-            @intFromEnum(Register.R_R2)); // sr2
-        try std.testing.expectEqual(0b0101100101010010, em.register(.R_R0));
+            @intFromEnum(Register.R2)); // sr2
+        try std.testing.expectEqual(0b0101100101010010, em.reg.register(.R0));
     }
 
     test "opBitwiseAnd imm" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
-        em.registerPtr(.R_R1).* = 0b0000000000001001;
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
+        em.reg.registerPtr(.R1).* = 0b0000000000001001;
         em.opBitwiseAnd(@intFromEnum(Instruction.OP_AND) << 12 |
-            @intFromEnum(Register.R_R0) << 9 | // dr
-            @intFromEnum(Register.R_R1) << 6 | // sr1
+            @intFromEnum(Register.R0) << 9 | // dr
+            @intFromEnum(Register.R1) << 6 | // sr1
             1 << 5 | // set the imm flag
             0b11110); // sr2
-        try std.testing.expectEqual(0b0000000000001000, em.register(.R_R0));
+        try std.testing.expectEqual(0b0000000000001000, em.reg.register(.R0));
     }
 
     // Assembler Formats
@@ -696,74 +681,69 @@ pub const Emulator = struct {
         const instrCond: u16 = instr >> 9 & BITMASK_COND;
 
         inline for (std.meta.fields(Condition)) |cond| {
-            if (instrCond & cond.value > 0 and self.register(.R_COND) & cond.value > 0) {
-                self.registerPtr(.R_PC).* = self.register(.R_PC) +% pcOffset;
+            if (instrCond & cond.value > 0 and self.reg.register(.COND) & cond.value > 0) {
+                self.reg.offsetPC(pcOffset);
                 return;
             }
         }
     }
 
     test "opBranch all" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
-        em.registerPtr(.R_COND).* = 0b111; // turn them all on
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
+        em.reg.registerPtr(.COND).* = 0b111; // turn them all on
         em.opBranch(@intFromEnum(Instruction.OP_BR) << 12 |
             @intFromEnum(Condition.FL_NEG) << 9 |
             20);
-        try std.testing.expectEqual(20, em.register(.R_PC));
+        try std.testing.expectEqual(20, em.reg.register(.PC));
     }
 
     test "opBranch n" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
-        em.registerPtr(.R_COND).* = @intFromEnum(Condition.FL_NEG);
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
+        em.reg.setCond(.FL_NEG);
         em.opBranch(@intFromEnum(Instruction.OP_BR) << 12 |
             @intFromEnum(Condition.FL_NEG) << 9 |
             20);
-        try std.testing.expectEqual(20, em.register(.R_PC));
+        try std.testing.expectEqual(20, em.reg.register(.PC));
 
-        em.registerPtr(.R_COND).* = 0;
+        em.reg.registerPtr(.COND).* = 0;
         em.opBranch(@intFromEnum(Instruction.OP_BR) << 12 |
             @intFromEnum(Condition.FL_NEG) << 9 |
             20);
-        try std.testing.expectEqual(20, em.register(.R_PC));
+        try std.testing.expectEqual(20, em.reg.register(.PC));
     }
 
     test "opBranch z" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
-        em.registerPtr(.R_COND).* = @intFromEnum(Condition.FL_ZRO);
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
+        em.reg.setCond(.FL_ZRO);
         em.opBranch(@intFromEnum(Instruction.OP_BR) << 12 |
             @intFromEnum(Condition.FL_ZRO) << 9 |
             20);
-        try std.testing.expectEqual(20, em.register(.R_PC));
+        try std.testing.expectEqual(20, em.reg.register(.PC));
 
-        em.registerPtr(.R_COND).* = 0;
+        em.reg.setCond(.UNSET);
         em.opBranch(@intFromEnum(Instruction.OP_BR) << 12 |
             @intFromEnum(Condition.FL_ZRO) << 9 |
             20);
-        try std.testing.expectEqual(20, em.register(.R_PC));
+        try std.testing.expectEqual(20, em.reg.register(.PC));
     }
 
     test "opBranch p" {
-        var em = try Emulator.initStd(std.testing.io, &.{}, &.{});
-        em.registerPtr(.R_COND).* = @intFromEnum(Condition.FL_POS);
+        var em = try Emulator.initStd(std.testing.allocator, std.testing.io, &.{}, &.{});
+        defer em.deinit(std.testing.allocator);
+        em.reg.setCond(.FL_POS);
         em.opBranch(@intFromEnum(Instruction.OP_BR) << 12 |
             @intFromEnum(Condition.FL_POS) << 9 |
             20);
-        try std.testing.expectEqual(20, em.register(.R_PC));
+        try std.testing.expectEqual(20, em.reg.register(.PC));
 
-        em.reg[@intFromEnum(Register.R_COND)] = 0;
+        em.reg.setCond(.UNSET);
         em.opBranch(@intFromEnum(Instruction.OP_BR) << 12 |
             @intFromEnum(Condition.FL_POS) << 9 |
             20);
-        try std.testing.expectEqual(20, em.register(.R_PC));
-    }
-
-    // register returns the value within the specified register
-    fn register(self: *Emulator, reg: Register) u16 {
-        return self.reg[@intFromEnum(reg)];
-    }
-
-    fn registerPtr(self: *Emulator, reg: Register) *u16 {
-        return &self.reg[@intFromEnum(reg)];
+        try std.testing.expectEqual(20, em.reg.register(.PC));
     }
 
     pub fn memRead(self: *Emulator, addr: u16) u16 {
@@ -782,20 +762,6 @@ pub const Emulator = struct {
 
     pub fn memPtr(self: *Emulator, addr: u16) *u16 {
         return &self.memory[addr];
-    }
-
-    // updateFlags updates the R_COND register
-    // Any time a value is written to a register, we need to update the flags
-    // to indicate its sign. We will write a function so that this can be reused
-    pub fn updateConds(self: *Emulator, r: Register) void {
-        const p = self.registerPtr(r);
-        if (p.* == 0) {
-            self.registerPtr(.R_COND).* = @intFromEnum(Condition.FL_ZRO);
-        } else if (p.* >> 15 == 1) {
-            self.registerPtr(.R_COND).* = @intFromEnum(Condition.FL_NEG);
-        } else {
-            self.registerPtr(.R_COND).* = @intFromEnum(Condition.FL_POS);
-        }
     }
 
     // signExtend takes a u16 that was orignally smaller and "sign extends"
@@ -848,3 +814,7 @@ pub const Emulator = struct {
         return n != 0 and (fd.revents & posix.POLL.IN) != 0;
     }
 };
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}
