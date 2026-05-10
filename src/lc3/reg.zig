@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const Condition = @import("condition.zig").Condition;
+
 // A register is a slot for storing a single value on the CPU. Registers are like the “workbench” of the CPU. For the CPU to work with a piece of data, it has to be in one of the registers. However, since there are just a few registers, only a minimal amount of data can be loaded at any given time. Programs work around this by loading values from memory into registers, calculating values into other registers, and then storing the final results back in memory.
 // The LC-3 has 10 total registers, each of which is 16 bits. Most of them are general purpose, but a few have designated roles. - 8 general purpose registers (R0-R7) - 1 program counter (PC) register - 1 condition flags (COND) register
 // The general purpose registers can be used to perform any program calculations. The program counter is an unsigned integer which is the address of the next instruction in memory to execute. The condition flags tell us information about the previous calculation.
@@ -19,15 +21,6 @@ pub const Registers = struct {
         PC,
         COND,
         _COUNT, //keep this at the end, tells us how many their are
-    };
-
-    // The COND register stores condition flags which provide information about the most recently executed calculation. This allows programs to check logical conditions such as if (x > 0) { ... }.
-    // Each CPU has a variety of condition flags to signal various situations. The LC-3 uses only 3 condition flags which indicate the sign of the previous calculation.
-    pub const Condition = enum(u16) {
-        UNSET = 0,
-        FL_POS = 1 << 0, // P
-        FL_ZRO = 1 << 1, // Z
-        FL_NEG = 1 << 2, // N
     };
 
     pub fn init() @This() {
@@ -88,17 +81,17 @@ pub const Registers = struct {
     pub fn setReg(self: *@This(), r: Register, val: u16) void {
         self.registerPtr(r).* = val;
         if (val == 0) {
-            self.setCond(.FL_ZRO);
+            self.setCond(.ZRO);
         } else if (val >> 15 == 1) {
-            self.setCond(.FL_NEG);
+            self.setCond(.NEG);
         } else {
-            self.setCond(.FL_POS);
+            self.setCond(.POS);
         }
     }
 
     // setCond will set the condition register
     pub fn setCond(self: *@This(), cond: Condition) void {
-        self.registerPtr(.COND).* = @intFromEnum(cond);
+        self.registerPtr(.COND).* = @intCast(@intFromEnum(cond));
     }
 };
 
@@ -157,7 +150,7 @@ test "Testing Register" {
         .{
             .name = "Cond",
             .set = .PC,
-            .value = @intFromEnum(Registers.Condition.FL_POS),
+            .value = @intFromEnum(Condition.POS),
         },
     };
 

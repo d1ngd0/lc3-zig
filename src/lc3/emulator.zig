@@ -8,6 +8,7 @@ const Reader = std.Io.Reader;
 const Registers = lc3.Registers;
 const Register = Registers.Register;
 const Condition = Registers.Condition;
+const Instruction = lc3.Instruction;
 
 // Emulator is the actual emulator that will run things
 pub const Emulator = struct {
@@ -35,42 +36,6 @@ pub const Emulator = struct {
 
     pub const EmulationError = error{
         ExecutionHault,
-    };
-
-    // An instruction is a command which tells the CPU to do some fundamental task, such as add two numbers. Instructions have both an opcode which indicates the kind of task to perform and a set of parameters which provide inputs to the task being performed.
-    // Each opcode represents one task that the CPU “knows” how to do. There are just 16 opcodes in LC-3. Everything the computer can calculate is some sequence of these simple instructions. Each instruction is 16 bits long, with the left 4 bits storing the opcode. The rest of the bits are used to store the parameters.
-    // We will discuss, in detail, what each instruction does later. For now, define the following opcodes. Make sure they stay in this order so that they are assigned the proper enum value:
-    pub const Instruction = enum(u16) {
-        OP_BR, // branch
-        OP_ADD, // add
-        OP_LD, // load
-        OP_ST, // store
-        OP_JSR, // jump register
-        OP_AND, // bitwise and
-        OP_LDR, // load register
-        OP_STR, // store register
-        OP_RTI, // unused
-        OP_NOT, // bitwise not
-        OP_LDI, // load indirect
-        OP_STI, // store indirect
-        OP_JMP, // jump
-        OP_RES, // reserved (unused)
-        OP_LEA, // load effective address
-        OP_TRAP, // execute trap
-    };
-
-    // The LC-3 provides a few predefined routines for performing common tasks and interacting with I/O devices.
-    // For example, there are routines for getting input from the keyboard and for displaying strings to the console.
-    // These are called trap routines which you can think of as the operating system or API for the LC-3.
-    // Each trap routine is assigned a trap code which identifies it (similar to an opcode). To execute one,
-    // the TRAP instruction is called with the trap code of the desired routine.
-    const Trap = enum(u16) {
-        TRAP_GETC = 0x20, // get character from keyboard, not echoed onto the terminal
-        TRAP_OUT = 0x21, // output a character
-        TRAP_PUTS = 0x22, // output a word string
-        TRAP_IN = 0x23, // get character from keyboard, echoed onto the terminal
-        TRAP_PUTSP = 0x24, // output a byte string
-        TRAP_HALT = 0x25, // halt the program
     };
 
     const MR_KBSR = 0xFE00; // keyboard status
@@ -133,9 +98,16 @@ pub const Emulator = struct {
 
         // var running: bool = true;
         while (true) {
-            const instr: u16 = self.fetchInstr();
-            // std.debug.print("{b:0>16}\n", .{instr});
-            const op: Instruction = @enumFromInt(instr >> OFFSET_OP);
+            const instr: Instruction = @bitCast(self.fetchInstr());
+            instr.execute(&self.reg, &self.memory);
+
+            if (checkKey()) {
+                const char = self.in.takeByte() catch NULL;
+                self.memPtr(MR_KBSR).* = (1 << 15);
+                self.memPtr(MR_KBDR).* = char;
+            } else {
+                self.memPtr(MR_KBSR).* = NULL;
+            }
 
             try switch (op) {
                 .OP_BR => self.opBranch(instr),
